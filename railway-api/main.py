@@ -13,7 +13,9 @@ try:
     import madmom
     from madmom.features.beats import DBNBeatTrackingProcessor, RNNBeatProcessor
     _HAVE_MADMOM = True
-except Exception:
+except Exception as e:
+    print(f"[WARNING] madmom not available: {e}")
+    print("[INFO] Using librosa for all tempo detection (madmom disabled)")
     _HAVE_MADMOM = False
 
 try:
@@ -130,10 +132,8 @@ async def analyze_audio(
                 # Accurate path: HPSS and robust key detection
                 y_harm, y_perc = librosa.effects.hpss(y)
                 # Detect BPM
-                if backend == "pro" and _HAVE_MADMOM:
-                    bpm, bpm_candidates = _madmom_bpm(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
-                else:
-                    bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+                # Use librosa-based BPM detection (madmom removed for Python 3.11+ compatibility)
+                bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
                 # Detect key from harmonic content with tuning + beat sync
                 key, key_candidates = _detect_key_with_candidates(y_harm, sr)
 
@@ -349,50 +349,7 @@ def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int, prefer_min: int = 9
     best_bpm = sorted_cands[0][0] if sorted_cands else float(librosa.beat.tempo(onset_envelope=onset_env, sr=sr))
     return best_bpm, sorted_cands
 
-def _madmom_bpm(y_perc: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -> tuple[float, list[tuple[float, float]]]:
-    """Tempo via madmom RNN + DBN beat tracker; return BPM and pseudo-confidence list."""
-    # madmom expects a file or mono float array; write a short temp wav to process reliably
-    import tempfile as _tmp
-    import os as _os
-    import uuid as _uuid
-    from soundfile import write as _sfwrite
-    tmpdir = _tmp.mkdtemp(prefix="mm-")
-    path = _os.path.join(tmpdir, f"{_uuid.uuid4().hex}.wav")
-    try:
-        _sfwrite(path, y_perc.astype(np.float32), sr)
-        proc = madmom.audio.signal.Signal(path)
-        act = RNNBeatProcessor()(path)
-        beats = DBNBeatTrackingProcessor(fps=100)(act)
-        # Estimate tempo from beat intervals
-        if len(beats) >= 2:
-            intervals = np.diff(beats)
-            tempos = 60.0 / intervals
-            # Robust central tendency
-            est = float(np.median(tempos))
-        else:
-            # fallback to librosa
-            est, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
-        # half/double adjustment
-        if est < prefer_min:
-            est *= 2
-        if est > prefer_max:
-            est /= 2
-        # Build a simple candidate list around estimate
-        candidates = [(est, 1.0)]
-        candidates += [(est * 2, 0.5), (est / 2, 0.5)]
-        # Dedup and sort
-        ded = {}
-        for b, c in candidates:
-            k = int(round(b))
-            ded[k] = max(ded.get(k, 0.0), c)
-        cand_list = sorted(((float(k), v) for k, v in ded.items()), key=lambda x: x[1], reverse=True)
-        return est, cand_list
-    finally:
-        try:
-            import shutil as _sh
-            _sh.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
+# _madmom_bpm function removed - madmom disabled for Python 3.11+ compatibility
 
 def _detect_bpm_fast(y: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -> tuple[float, list[tuple[float, float]]]:
     """Very fast BPM estimate: novelty from high-pass + energy envelope + autocorr peak."""
