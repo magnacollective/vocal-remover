@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response,
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
+from contextlib import asynccontextmanager
 import tempfile
 import os
 import shutil
@@ -29,19 +30,28 @@ except Exception:
     
 import soundfile as sf
 
-app = FastAPI(title="Vocal Remover & Audio Analysis API")
-
 # Global model cache for performance
 _CACHED_MODEL = None
 
-def get_cached_model():
-    """Get cached htdemucs model, loading once at startup."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model at startup to avoid first-request delays."""
     global _CACHED_MODEL
-    if _CACHED_MODEL is None and _HAVE_DEMUCS:
-        print("[model_cache] Loading htdemucs model...")
+    if _HAVE_DEMUCS:
+        print("[startup] Loading htdemucs model...")
         _CACHED_MODEL = pretrained.get_model('htdemucs')
         _CACHED_MODEL.eval()
-        print("[model_cache] Model loaded and cached")
+        print("[startup] Model loaded and ready")
+    else:
+        print("[startup] Demucs not available, using fallback methods")
+    yield
+    # Cleanup on shutdown
+    _CACHED_MODEL = None
+
+app = FastAPI(title="Vocal Remover & Audio Analysis API", lifespan=lifespan)
+
+def get_cached_model():
+    """Get cached htdemucs model (loaded at startup)."""
     return _CACHED_MODEL
 
 # CORS configuration (env-driven with safe defaults)
@@ -90,7 +100,21 @@ def version():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "model_loaded": _CACHED_MODEL is not None,
+        "demucs_available": _HAVE_DEMUCS
+    }
+
+@app.get("/warmup")
+def warmup():
+    """Warmup endpoint to preload model if needed."""
+    model = get_cached_model()
+    return {
+        "status": "warmed",
+        "model_ready": model is not None,
+        "demucs_available": _HAVE_DEMUCS
+    }
 
 @app.post("/analyze")
 async def analyze_audio(
