@@ -437,18 +437,23 @@ def _detect_bpm_fast(y: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -
 def _detect_key_fast(y: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
     """Fast but accurate key detection using chroma features."""
     try:
-        # Use both CQT and STFT chroma for better accuracy
-        chroma_cqt = librosa.feature.chroma_cqt(y=y, sr=sr)
-        chroma_stft = librosa.feature.chroma_stft(y=y, sr=sr)
+        print(f"[key_detection] Starting key detection, audio shape: {y.shape}, sr: {sr}")
         
-        # Average the two methods
-        chroma = (chroma_cqt + chroma_stft) / 2
-        vec = chroma.mean(axis=1)
+        # Use CQT chroma for better pitch resolution
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=1024, bins_per_octave=12*3)
+        print(f"[key_detection] Chroma shape: {chroma.shape}")
+        
+        # Use median instead of mean to reduce noise influence
+        vec = np.median(chroma, axis=1)
+        print(f"[key_detection] Chroma vector: {vec}")
         
         # Normalize
         s = float(vec.sum())
         if s > 0:
             vec = vec / s
+        else:
+            print("[key_detection] Warning: zero chroma sum, using uniform distribution")
+            vec = np.ones(12) / 12
         
         # Krumhansl-Schmuckler key profiles
         major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -461,29 +466,33 @@ def _detect_key_fast(y: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float
         
         for i in range(12):
             # Calculate correlation with both major and minor profiles
-            cmaj = float(np.corrcoef(vec, np.roll(major_profile, i))[0, 1])
-            cmin = float(np.corrcoef(vec, np.roll(minor_profile, i))[0, 1])
+            maj_shifted = np.roll(major_profile, i)
+            min_shifted = np.roll(minor_profile, i)
             
-            # Handle NaN correlations
-            if np.isnan(cmaj):
-                cmaj = 0.0
-            if np.isnan(cmin):
-                cmin = 0.0
-                
+            # Use dot product instead of correlation for better stability
+            cmaj = float(np.dot(vec, maj_shifted))
+            cmin = float(np.dot(vec, min_shifted))
+            
             cands.append((f"{keys[i]} Major", cmaj))
             cands.append((f"{keys[i]} Minor", cmin))
         
         # Sort by correlation strength
         cands.sort(key=lambda x: x[1], reverse=True)
+        print(f"[key_detection] Top 3 candidates: {cands[:3]}")
         
         # Normalize scores
         top = cands[0][1] if cands and cands[0][1] > 0 else 1.0
         norm = [(k, max(0.0, c/top) if top > 0 else 0.0) for k, c in cands]
         
-        return (norm[0][0] if norm else "C Major"), norm[:5]
+        best_key = norm[0][0] if norm else "C Major"
+        print(f"[key_detection] Selected key: {best_key}")
+        
+        return best_key, norm[:5]
         
     except Exception as e:
-        print(f"Fast key detection error: {e}")
+        print(f"[key_detection] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return "C Major", [("C Major", 0.0)]
 
 def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
