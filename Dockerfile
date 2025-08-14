@@ -18,6 +18,7 @@ COPY requirements.txt .
 # Preinstall build/runtime deps needed by legacy setup.py packages (madmom needs Cython & numpy at egg_info time)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir Cython==0.29.36 numpy==1.24.3 scipy==1.11.3 && \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.8.0+cpu torchaudio==2.8.0+cpu && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
