@@ -1,0 +1,77 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Tune Prism",
+    "version": "0.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "path": {
+        "all": true
+      },
+      "all": false,
+      "shell": {
+        "all": false,
+        "open": true
+      },
+      "protocol": {
+        "all": true,
+        "asset": true,
+        "assetScope": ["**"]
+      },
+      "fs": {
+        "all": true,
+        "readFile": true,
+        "writeFile": true,
+        "readDir": true,
+        "copyFile": true,
+        "createDir": true,
+        "removeDir": true,
+        "removeFile": true,
+        "renameFile": true,
+        "exists": true
+      }
+    },
+    "bundle": {
+      "active": true,
+      "targets": "all",
+      "identifier": "com.splitter.dev",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ],
+      "macOS": {
+        "frameworks": [
+            "../libtorch/lib/libtorch_cpu.dylib",
+            "../libtorch/lib/libtorch.dylib",
+            "../libtorch/lib/libc10.dylib",
+            "/opt/homebrew/Cellar/libomp/18.1.2/lib/libomp.dylib"
+        ]
+      },
+      "resources": [
+          "./models/*",
+          "./resources/*"
+      ]
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "resizable": true,
+        "title": "TunePrism",
+        "width": 800,
+        "height": 700
+      }
+    ]
+  }
+}
