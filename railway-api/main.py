@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
@@ -55,7 +55,12 @@ def health():
     return {"status": "healthy"}
 
 @app.post("/analyze")
-async def analyze_audio(audio: UploadFile = File(...)):
+async def analyze_audio(
+    audio: UploadFile = File(...),
+    window_sec: int = Query(75, ge=15, le=180),
+    prefer_min_bpm: int = Query(90, ge=40, le=200),
+    prefer_max_bpm: int = Query(180, ge=60, le=240),
+):
     """Analyze uploaded audio for BPM, key, duration, and sample rate.
     Returns: {"bpm": float, "key": string, "duration": string, "sample_rate": string}
     """
@@ -68,19 +73,19 @@ async def analyze_audio(audio: UploadFile = File(...)):
             with open(input_path, "wb") as f:
                 shutil.copyfileobj(audio.file, f)
 
-            # Convert to WAV if needed
-            wav_path = _ensure_wav(input_path, tmpdir)
+            # Convert to speedy analysis WAV (mono, 22.05kHz, middle window)
+            wav_path = _prepare_analysis_wav(input_path, tmpdir, window_sec=window_sec)
             print(f"[analyze] Processing: {wav_path}")
 
             # Load audio with librosa (mono for analysis)
-            y, sr = librosa.load(wav_path, sr=None, mono=True)
+            y, sr = librosa.load(wav_path, sr=22050, mono=True)
             duration_seconds = len(y) / sr
 
             # Separate harmonic/percussive for improved analysis
             y_harm, y_perc = librosa.effects.hpss(y)
 
             # Detect BPM from percussive/onset envelope; resolve half/double and expose candidates
-            bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr)
+            bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
 
             # Detect key from harmonic content with tuning + beat sync
             key, key_candidates = _detect_key_with_candidates(y_harm, sr)
@@ -164,10 +169,35 @@ def _ensure_wav(input_path: str, tmpdir: str) -> str:
     try:
         subprocess.check_call(cmd)
         return output_path
+
+def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 75) -> str:
+    """Convert input to fast-to-analyze mono 22.05kHz WAV and trim to the most informative middle window.
+    This speeds up analysis and reduces intro/outro bias.
+    """
+    probe = os.path.join(tmpdir, "probe.wav")
+    # First convert to mono 22.05kHz
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "warning",
+        "-i", input_path,
+        "-vn", "-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le",
+        probe,
+    ]
+    subprocess.check_call(cmd)
+
+    # Load to get duration and trim middle segment
+    y, sr = librosa.load(probe, sr=22050, mono=True)
+    total_sec = len(y) / sr
+    win = max(15, min(window_sec, int(total_sec)))
+    start = max(0, int((total_sec - win) / 2))
+    end = start + win
+    trimmed = y[start * sr : end * sr]
+    out = os.path.join(tmpdir, "analysis.wav")
+    sf.write(out, trimmed, sr)
+    return out
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
-def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int) -> tuple[float, list[tuple[float, float]]]:
+def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int, prefer_min: int = 90, prefer_max: int = 180) -> tuple[float, list[tuple[float, float]]]:
     """Detect BPM robustly using onset envelope, tempogram autocorrelation, and resolve half/double.
     Returns (best_bpm, candidates[(bpm, confidence)...])
     """
@@ -177,9 +207,9 @@ def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int) -> tuple[float, lis
         # Fallback to beat_track on raw signal
         tempo, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
         tempo = float(tempo)
-        if tempo < 90:
+        if tempo < prefer_min:
             tempo *= 2
-        if tempo > 180:
+        if tempo > prefer_max:
             tempo /= 2
         return tempo, [(tempo, 0.5)]
 
@@ -209,9 +239,9 @@ def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int) -> tuple[float, lis
         chosen = list(zip(tempos[:5], confs))
         best = float(tempos[0])
         # half/double adjustment
-        if best < 90:
+        if best < prefer_min:
             best *= 2
-        if best > 180:
+        if best > prefer_max:
             best /= 2
         return float(best), [(float(b), float(c)) for b, c in chosen]
 
@@ -228,13 +258,14 @@ def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int) -> tuple[float, lis
     scored: list[tuple[float, float]] = []
     for bpm, conf in zip(cand_bpms, cand_confs):
         variants = {bpm}
-        if bpm < 90:
+        if bpm < prefer_min:
             variants.add(bpm * 2)
-        if bpm > 180:
+        if bpm > prefer_max:
             variants.add(bpm / 2)
         for v in variants:
             # score prefers mid-tempo and higher confidence
-            score = conf - (abs(v - 120.0) / 200.0)
+            mid = (prefer_min + prefer_max) / 2.0
+            score = conf - (abs(v - mid) / (prefer_max - prefer_min))
             scored.append((float(v), float(max(0.0, score))))
 
     # Deduplicate by rounding BPM
