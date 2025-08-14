@@ -437,19 +437,21 @@ def _detect_bpm_fast(y: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -
 def _detect_key_fast(y: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
     """Simple and reliable key detection using basic chroma features."""
     try:
-        # Use basic STFT chroma - simple and reliable
-        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        # Use CQT chroma for better pitch resolution
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, bins_per_octave=36)
         
-        # Average chroma over time
-        chroma_mean = np.mean(chroma, axis=1)
+        # Use weighted average - emphasize stronger frames
+        frame_strength = np.sum(chroma, axis=0)
+        weights = frame_strength / (frame_strength.sum() + 1e-8)
+        chroma_mean = np.average(chroma, axis=1, weights=weights)
         
         # Normalize 
         if chroma_mean.sum() > 0:
             chroma_mean = chroma_mean / chroma_mean.sum()
         
-        # Simple major/minor templates (simplified)
-        major_template = np.array([1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0])  # Major scale
-        minor_template = np.array([1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0])  # Natural minor
+        # Improved templates with chord emphasis (root, third, fifth)
+        major_template = np.array([3.0, 0.5, 2.0, 0.5, 2.5, 2.0, 0.5, 3.0, 0.5, 2.0, 0.5, 1.5])  # Emphasize I, iii, V
+        minor_template = np.array([3.0, 0.5, 1.5, 2.5, 0.5, 2.0, 0.5, 3.0, 2.0, 0.5, 1.5, 0.5])  # Emphasize i, III, v
         
         major_template = major_template / major_template.sum()
         minor_template = minor_template / minor_template.sum()
@@ -476,9 +478,20 @@ def _detect_key_fast(y: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float
         # Return best match
         best_key = scores[0][0]
         
-        # Normalize confidence scores
+        # Boost confidence based on separation from second-best
+        top_score = scores[0][1]
+        second_score = scores[1][1] if len(scores) > 1 else 0.0
+        separation = top_score - second_score
+        confidence_boost = min(1.0, separation * 2.0)  # Boost if clear winner
+        
+        # Normalize confidence scores with boost
         max_score = scores[0][1] if scores[0][1] > 0 else 1.0
-        normalized_scores = [(key, score/max_score) for key, score in scores[:5]]
+        normalized_scores = []
+        for i, (key, score) in enumerate(scores[:5]):
+            conf = score / max_score
+            if i == 0:  # Boost top result
+                conf = min(1.0, conf + confidence_boost * 0.2)
+            normalized_scores.append((key, conf))
         
         return best_key, normalized_scores
         
