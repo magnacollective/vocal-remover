@@ -22,10 +22,9 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 
 # Copy application code
 COPY main.py .
-COPY test_minimal.py .
 
 # Railway dynamically assigns ports - use $PORT
 EXPOSE $PORT
 
-# Test with minimal server first
-CMD ["python", "test_minimal.py"]
+# Use full application
+CMD ["python", "main.py"]

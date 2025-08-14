@@ -35,7 +35,8 @@ _CACHED_MODEL = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Configure startup settings without loading heavy models."""
+    """Load model at startup for immediate availability."""
+    global _CACHED_MODEL
     if _HAVE_DEMUCS:
         # Optimize torch for multi-CPU performance
         import torch
@@ -43,32 +44,28 @@ async def lifespan(app: FastAPI):
         torch.set_num_threads(num_threads)
         torch.set_num_interop_threads(num_threads)
         print(f"[startup] Configured torch with {num_threads} threads")
-        print("[startup] Demucs available - will load on first separation request")
-    else:
-        print("[startup] Demucs not available, using fallback methods")
-    print("[startup] Server ready for requests")
-    yield
-    # Cleanup on shutdown
-    global _CACHED_MODEL
-    _CACHED_MODEL = None
-
-app = FastAPI(title="Vocal Remover & Audio Analysis API", lifespan=lifespan)
-
-def get_cached_model():
-    """Get cached htdemucs model, loading on first use."""
-    global _CACHED_MODEL
-    if _CACHED_MODEL is None and _HAVE_DEMUCS:
-        print("[model] Loading htdemucs model on first use...")
+        
+        print("[startup] Loading htdemucs model...")
         _CACHED_MODEL = pretrained.get_model('htdemucs')
         _CACHED_MODEL.eval()
         
         # Move model to GPU if available
         if torch.cuda.is_available():
             _CACHED_MODEL = _CACHED_MODEL.cuda()
-            print("[model] Model loaded on GPU")
+            print("[startup] Model loaded on GPU")
         else:
-            print("[model] Model loaded on CPU")
-        print("[model] Model ready for separation")
+            print("[startup] Model loaded on CPU")
+        print("[startup] Model ready - all endpoints operational")
+    else:
+        print("[startup] Demucs not available, using fallback methods")
+    yield
+    # Cleanup on shutdown
+    _CACHED_MODEL = None
+
+app = FastAPI(title="Vocal Remover & Audio Analysis API", lifespan=lifespan)
+
+def get_cached_model():
+    """Get cached htdemucs model (loaded at startup)."""
     return _CACHED_MODEL
 
 # CORS configuration (env-driven with safe defaults)
