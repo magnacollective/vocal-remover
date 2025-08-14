@@ -73,11 +73,17 @@ def get_cached_model():
 
 # CORS configuration (env-driven with safe defaults)
 ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "*")
-# Clean up origins: remove semicolons and extra whitespace
+# Clean up origins: handle both comma and semicolon separators, remove quotes
 if ALLOWED_ORIGINS_STR == "*":
     ALLOWED_ORIGINS = ["*"]
 else:
-    ALLOWED_ORIGINS = [origin.strip().rstrip(';').strip('"').strip("'") for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
+    # Replace semicolons with commas, then split
+    cleaned = ALLOWED_ORIGINS_STR.replace(';', ',')
+    ALLOWED_ORIGINS = [
+        origin.strip().strip('"').strip("'") 
+        for origin in cleaned.split(",") 
+        if origin.strip() and origin.strip() != ','
+    ]
 print(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
 
 # Use only FastAPI's CORSMiddleware to avoid duplicate headers

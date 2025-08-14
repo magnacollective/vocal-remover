@@ -23,8 +23,8 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Copy application code
 COPY main.py .
 
-# Railway dynamically assigns ports
-EXPOSE 8000
+# Railway dynamically assigns ports - use $PORT
+EXPOSE $PORT
 
-# Use Python directly to handle PORT env variable properly
-CMD ["python", "main.py"]
+# Use uvicorn directly with Railway's expected format
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
