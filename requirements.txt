@@ -5,3 +5,5 @@ librosa==0.10.1
 soundfile==0.12.1
 scipy==1.11.3
 numpy==1.24.3
+demucs==4.0.1
+torch>=2.0.0

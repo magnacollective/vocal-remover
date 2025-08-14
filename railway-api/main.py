@@ -15,6 +15,16 @@ try:
     _HAVE_MADMOM = True
 except Exception:
     _HAVE_MADMOM = False
+
+try:
+    from demucs import pretrained
+    from demucs.separate import load_track, apply_model
+    from demucs.audio import convert_audio, save_audio
+    import torch
+    _HAVE_DEMUCS = True
+except Exception:
+    _HAVE_DEMUCS = False
+    
 import soundfile as sf
 
 app = FastAPI(title="Vocal Remover & Audio Analysis API")
@@ -166,9 +176,12 @@ async def separate_stems(
         wav_path = _ensure_wav(input_path, tmpdir)
         print(f"[separate] Processing: {wav_path}")
 
-        # For now, use simple vocal removal technique
-        # TODO: Integrate HTDemucs or other advanced models
-        output_path = _simple_vocal_removal(wav_path, tmpdir, stem_type)
+        # Use AI-based separation if available, fallback to simple method
+        if _HAVE_DEMUCS:
+            output_path = _ai_vocal_separation(wav_path, tmpdir, stem_type)
+        else:
+            print("[separate] Warning: Using fallback simple vocal removal (low quality)")
+            output_path = _simple_vocal_removal(wav_path, tmpdir, stem_type)
 
         if not os.path.exists(output_path):
             raise HTTPException(status_code=500, detail="Stem separation failed: output not created")
@@ -495,6 +508,73 @@ def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[
     except Exception as e:
         print(f"Key detection error: {e}")
         return "C Major", [("C Major", 0.0)]
+
+def _ai_vocal_separation(wav_path: str, tmpdir: str, stem_type: str) -> str:
+    """AI-based vocal separation using Demucs."""
+    try:
+        print(f"[ai_separation] Starting AI separation for {stem_type}")
+        
+        # Load htdemucs model
+        model = pretrained.get_model('htdemucs')
+        model.eval()
+        
+        # Load and convert audio
+        wav = load_track(wav_path, model.audio_channels, model.samplerate)
+        print(f"[ai_separation] Loaded audio: {wav.shape}")
+        
+        # Apply separation
+        ref = wav.mean(0)  
+        wav = (wav - ref.mean()) / ref.std()  # Normalize
+        sources = apply_model(model, wav[None], device='cpu', progress=True)[0]
+        sources = sources * ref.std() + ref.mean()  # Denormalize
+        
+        # Get source names (typically: drums, bass, other, vocals)
+        source_names = model.sources
+        print(f"[ai_separation] Available sources: {source_names}")
+        
+        # Map requested stem to model sources
+        if stem_type == "instrumental":
+            # Combine all non-vocal sources
+            vocal_idx = source_names.index('vocals') if 'vocals' in source_names else -1
+            if vocal_idx >= 0:
+                # Sum all sources except vocals
+                output_audio = torch.sum(sources[[i for i in range(len(sources)) if i != vocal_idx]], dim=0)
+            else:
+                output_audio = torch.sum(sources, dim=0)  # Fallback
+        elif stem_type in source_names:
+            # Get specific source
+            source_idx = source_names.index(stem_type)
+            output_audio = sources[source_idx]
+        else:
+            raise HTTPException(status_code=400, detail=f"Stem type '{stem_type}' not available in model sources: {source_names}")
+        
+        # Save output
+        output_path = os.path.join(tmpdir, f"{stem_type}.wav")
+        print(f"[ai_separation] Writing to: {output_path}")
+        print(f"[ai_separation] Output shape: {output_audio.shape}, dtype: {output_audio.dtype}")
+        
+        # Convert to numpy and save
+        output_numpy = output_audio.detach().cpu().numpy()
+        # Demucs outputs (channels, samples), transpose for soundfile (samples, channels)
+        if output_numpy.ndim == 2:
+            output_numpy = output_numpy.T
+        
+        sf.write(output_path, output_numpy, model.samplerate)
+        
+        # Verify file was created
+        if not os.path.exists(output_path):
+            print(f"[ai_separation] ERROR: File was not created at {output_path}")
+            raise HTTPException(status_code=500, detail=f"Failed to create output file: {output_path}")
+        
+        file_size = os.path.getsize(output_path)
+        print(f"[ai_separation] Created {stem_type} stem: {output_path} (size: {file_size} bytes)")
+        return output_path
+        
+    except Exception as e:
+        print(f"[ai_separation] Error: {e}")
+        print(f"[ai_separation] Falling back to simple vocal removal")
+        # Fallback to simple method if AI separation fails
+        return _simple_vocal_removal(wav_path, tmpdir, stem_type)
 
 def _simple_vocal_removal(wav_path: str, tmpdir: str, stem_type: str) -> str:
     """Simple vocal removal using center channel extraction."""
