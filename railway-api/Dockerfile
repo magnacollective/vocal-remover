@@ -14,9 +14,9 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies
-# Install Cython first so madmom's setup.py can import it during egg_info
+# Preinstall build/runtime deps needed by legacy setup.py packages (madmom needs Cython & numpy at egg_info time)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir Cython==0.29.36 && \
+    pip install --no-cache-dir Cython==0.29.36 numpy==1.24.3 scipy==1.11.3 && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
