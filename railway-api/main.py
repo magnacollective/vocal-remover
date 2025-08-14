@@ -358,26 +358,10 @@ def _madmom_bpm(y_perc: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -
             pass
 
 def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
-    """Detect musical key and provide candidates with confidence using tuned, beat-synchronous chroma.
+    """Detect musical key with two robust chroma variants and pick the stronger one.
     Returns (best_key, [(key, confidence)...])
     """
     try:
-        # Estimate tuning and compute chroma CQT on harmonic signal
-        tuning = librosa.estimate_tuning(y=y_harm, sr=sr)
-        chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, tuning=tuning, bins_per_octave=12, n_chroma=12)
-
-        # Beat-synchronous median aggregation
-        tempo, beats = librosa.beat.beat_track(y=y_harm, sr=sr)
-        if beats is not None and len(beats) > 1:
-            chroma_sync = librosa.util.sync(chroma, beats, aggregate=np.median)
-        else:
-            chroma_sync = chroma
-
-        chroma_mean = np.mean(chroma_sync, axis=1)
-        s = np.sum(chroma_mean)
-        if s > 0:
-            chroma_mean = chroma_mean / s
-
         # KS profiles
         major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
         minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
@@ -385,21 +369,52 @@ def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[
         minor_profile = minor_profile / np.sum(minor_profile)
         keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-        candidates: list[tuple[str, float]] = []
-        for i in range(12):
-            cmaj = float(np.corrcoef(chroma_mean, np.roll(major_profile, i))[0, 1])
-            cmin = float(np.corrcoef(chroma_mean, np.roll(minor_profile, i))[0, 1])
-            candidates.append((f"{keys[i]} Major", cmaj))
-            candidates.append((f"{keys[i]} Minor", cmin))
+        def corr_candidates(chroma_mat: np.ndarray) -> list[tuple[str, float]]:
+            chroma_mean = np.mean(chroma_mat, axis=1)
+            s = float(np.sum(chroma_mean))
+            if s > 0:
+                chroma_vec = chroma_mean / s
+            else:
+                chroma_vec = chroma_mean
+            cands: list[tuple[str, float]] = []
+            best = -1.0
+            for i in range(12):
+                cmaj = float(np.corrcoef(chroma_vec, np.roll(major_profile, i))[0, 1])
+                cmin = float(np.corrcoef(chroma_vec, np.roll(minor_profile, i))[0, 1])
+                cands.append((f"{keys[i]} Major", cmaj))
+                cands.append((f"{keys[i]} Minor", cmin))
+                best = max(best, cmaj, cmin)
+            cands.sort(key=lambda x: x[1], reverse=True)
+            # Normalize by top
+            top = cands[0][1] if cands else 1.0
+            return [(k, (c / top) if top else 0.0) for k, c in cands]
 
-        # Sort by correlation (confidence)
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        best_key, best_conf = candidates[0]
+        # Variant A: tuned CQT chroma at 36 bins, fold to 12
+        tuning = librosa.estimate_tuning(y=y_harm, sr=sr)
+        chroma36 = librosa.feature.chroma_cqt(y=y_harm, sr=sr, tuning=tuning, bins_per_octave=36, n_chroma=36)
+        tempo, beats = librosa.beat.beat_track(y=y_harm, sr=sr)
+        if beats is not None and len(beats) > 1:
+            chroma36 = librosa.util.sync(chroma36, beats, aggregate=np.median)
+        # fold 36 -> 12 by summing every 3 bins
+        if chroma36.shape[0] == 36:
+            chroma12_a = chroma36.reshape(12, 3, -1).sum(axis=1)
+        else:
+            chroma12_a = librosa.feature.chroma_cqt(y=y_harm, sr=sr, tuning=tuning, bins_per_octave=12, n_chroma=12)
 
-        # Normalize confidences to 0..1 by top score
-        top = max(c for _, c in candidates) or 1.0
-        norm_cands = [(k, c / top) for k, c in candidates]
-        return best_key, norm_cands
+        cands_a = corr_candidates(chroma12_a)
+        best_a = cands_a[0][1] if cands_a else 0.0
+
+        # Variant B: chroma CENS (robust to dynamics)
+        chroma_cens = librosa.feature.chroma_cens(y=y_harm, sr=sr)
+        if beats is not None and len(beats) > 1:
+            chroma_cens = librosa.util.sync(chroma_cens, beats, aggregate=np.median)
+        cands_b = corr_candidates(chroma_cens)
+        best_b = cands_b[0][1] if cands_b else 0.0
+
+        # Choose variant with stronger top confidence, return merged top-10 for transparency
+        chosen = cands_a if best_a >= best_b else cands_b
+        best_key = chosen[0][0] if chosen else "C Major"
+        return best_key, chosen[:10]
     except Exception as e:
         print(f"Key detection error: {e}")
         return "C Major", [("C Major", 0.0)]
