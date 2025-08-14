@@ -155,9 +155,9 @@ async def analyze_audio(
                     prefer_min_bpm, prefer_max_bpm = 70, 190
 
             if profile == "accurate":
-                window = min(120, max(60, window_sec))
+                window = min(60, max(30, window_sec))
             else:
-                window = min(75, max(45, window_sec))
+                window = min(30, max(15, window_sec))
 
             # Convert to speedy analysis WAV (mono, 22.05kHz, middle window)
             wav_path = _prepare_analysis_wav(input_path, tmpdir, window_sec=window)
@@ -167,18 +167,16 @@ async def analyze_audio(
             y, sr = librosa.load(wav_path, sr=22050, mono=True)
             duration_seconds = len(y) / sr
 
-            if profile == "fast":
-                # Ultra-fast path: avoid HPSS/CQT/beat tracking
+            # Always use fast algorithms for speed (both profiles are now fast)
+            if profile == "accurate":
+                # Slightly better algorithms but still fast
+                y_harm, y_perc = librosa.effects.hpss(y)
+                bpm, bpm_candidates = _detect_bpm_fast(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+                key, key_candidates = _detect_key_fast(y_harm, sr)
+            else:
+                # Ultra-fast path: skip HPSS
                 bpm, bpm_candidates = _detect_bpm_fast(y, sr, prefer_min_bpm, prefer_max_bpm)
                 key, key_candidates = _detect_key_fast(y, sr)
-            else:
-                # Accurate path: HPSS and robust key detection
-                y_harm, y_perc = librosa.effects.hpss(y)
-                # Detect BPM
-                # Use librosa-based BPM detection (madmom removed for Python 3.11+ compatibility)
-                bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
-                # Detect key from harmonic content with tuning + beat sync
-                key, key_candidates = _detect_key_with_candidates(y_harm, sr)
 
             analysis_result = {
                 "bpm": round(float(bpm), 1),
@@ -279,7 +277,7 @@ def _ensure_wav(input_path: str, tmpdir: str) -> str:
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
-def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 75) -> str:
+def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 30) -> str:
     """Convert input to fast-to-analyze mono 22.05kHz WAV and trim to the most informative middle window.
     This speeds up analysis and reduces intro/outro bias.
     """
