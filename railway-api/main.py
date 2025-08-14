@@ -435,65 +435,56 @@ def _detect_bpm_fast(y: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -
         return float(tempo), [(float(tempo), 0.5)]
 
 def _detect_key_fast(y: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
-    """Fast but accurate key detection using chroma features."""
+    """Simple and reliable key detection using basic chroma features."""
     try:
-        print(f"[key_detection] Starting key detection, audio shape: {y.shape}, sr: {sr}")
+        # Use basic STFT chroma - simple and reliable
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
         
-        # Use CQT chroma for better pitch resolution
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=1024, bins_per_octave=12*3)
-        print(f"[key_detection] Chroma shape: {chroma.shape}")
+        # Average chroma over time
+        chroma_mean = np.mean(chroma, axis=1)
         
-        # Use median instead of mean to reduce noise influence
-        vec = np.median(chroma, axis=1)
-        print(f"[key_detection] Chroma vector: {vec}")
+        # Normalize 
+        if chroma_mean.sum() > 0:
+            chroma_mean = chroma_mean / chroma_mean.sum()
         
-        # Normalize
-        s = float(vec.sum())
-        if s > 0:
-            vec = vec / s
-        else:
-            print("[key_detection] Warning: zero chroma sum, using uniform distribution")
-            vec = np.ones(12) / 12
+        # Simple major/minor templates (simplified)
+        major_template = np.array([1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0])  # Major scale
+        minor_template = np.array([1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0])  # Natural minor
         
-        # Krumhansl-Schmuckler key profiles
-        major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-        minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-        major_profile /= major_profile.sum()
-        minor_profile /= minor_profile.sum()
+        major_template = major_template / major_template.sum()
+        minor_template = minor_template / minor_template.sum()
         
         keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        cands = []
+        scores = []
         
+        # Test all 24 keys (12 major + 12 minor)
         for i in range(12):
-            # Calculate correlation with both major and minor profiles
-            maj_shifted = np.roll(major_profile, i)
-            min_shifted = np.roll(minor_profile, i)
+            # Rotate templates to different keys
+            maj_rotated = np.roll(major_template, i)
+            min_rotated = np.roll(minor_template, i)
             
-            # Use dot product instead of correlation for better stability
-            cmaj = float(np.dot(vec, maj_shifted))
-            cmin = float(np.dot(vec, min_shifted))
+            # Calculate similarity (dot product)
+            maj_score = np.dot(chroma_mean, maj_rotated)
+            min_score = np.dot(chroma_mean, min_rotated)
             
-            cands.append((f"{keys[i]} Major", cmaj))
-            cands.append((f"{keys[i]} Minor", cmin))
+            scores.append((f"{keys[i]} Major", float(maj_score)))
+            scores.append((f"{keys[i]} Minor", float(min_score)))
         
-        # Sort by correlation strength
-        cands.sort(key=lambda x: x[1], reverse=True)
-        print(f"[key_detection] Top 3 candidates: {cands[:3]}")
+        # Sort by score
+        scores.sort(key=lambda x: x[1], reverse=True)
         
-        # Normalize scores
-        top = cands[0][1] if cands and cands[0][1] > 0 else 1.0
-        norm = [(k, max(0.0, c/top) if top > 0 else 0.0) for k, c in cands]
+        # Return best match
+        best_key = scores[0][0]
         
-        best_key = norm[0][0] if norm else "C Major"
-        print(f"[key_detection] Selected key: {best_key}")
+        # Normalize confidence scores
+        max_score = scores[0][1] if scores[0][1] > 0 else 1.0
+        normalized_scores = [(key, score/max_score) for key, score in scores[:5]]
         
-        return best_key, norm[:5]
+        return best_key, normalized_scores
         
     except Exception as e:
-        print(f"[key_detection] ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return "C Major", [("C Major", 0.0)]
+        print(f"Key detection error: {e}")
+        return "C Major", [("C Major", 1.0)]
 
 def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
     """Detect musical key with two robust chroma variants and pick the stronger one.
