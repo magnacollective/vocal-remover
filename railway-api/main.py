@@ -72,24 +72,26 @@ async def analyze_audio(audio: UploadFile = File(...)):
             wav_path = _ensure_wav(input_path, tmpdir)
             print(f"[analyze] Processing: {wav_path}")
 
-            # Load audio with librosa
+            # Load audio with librosa (mono for analysis)
             y, sr = librosa.load(wav_path, sr=None, mono=True)
             duration_seconds = len(y) / sr
 
             # Separate harmonic/percussive for improved analysis
             y_harm, y_perc = librosa.effects.hpss(y)
 
-            # Detect BPM from percussive/onset envelope; resolve half/double
-            bpm = _detect_bpm(y_perc, sr)
+            # Detect BPM from percussive/onset envelope; resolve half/double and expose candidates
+            bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr)
 
             # Detect key from harmonic content with tuning + beat sync
-            key = _detect_key(y_harm, sr)
+            key, key_candidates = _detect_key_with_candidates(y_harm, sr)
 
             analysis_result = {
                 "bpm": round(float(bpm), 1),
                 "key": key,
                 "duration": _format_duration(duration_seconds),
                 "sample_rate": f"{sr} Hz",
+                "bpm_candidates": [{"bpm": round(float(b), 1), "confidence": float(c)} for b, c in bpm_candidates[:5]],
+                "key_candidates": [{"key": k, "confidence": float(c)} for k, c in key_candidates[:5]],
             }
 
             print(f"[analyze] Analysis complete: {analysis_result}")
@@ -165,58 +167,96 @@ def _ensure_wav(input_path: str, tmpdir: str) -> str:
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
-def _detect_bpm(y_perc: np.ndarray, sr: int) -> float:
-    """Detect BPM with onset envelope and resolve half/double tempo."""
-    try:
-        # Onset envelope from percussive signal
-        onset_env = librosa.onset.onset_strength(y=y_perc, sr=sr)
-
-        # Multiple tempo candidates
-        tempos = librosa.beat.tempo(
-            onset_envelope=onset_env,
-            sr=sr,
-            hop_length=512,
-            max_tempo=220,
-            aggregate=None,
-        )
-        if tempos is None or len(tempos) == 0:
-            raise ValueError("no tempo candidates")
-
-        # Use strongest candidate
-        tempo = float(tempos[0])
-
-        # Resolve half/double ambiguity with simple heuristics
-        # Prefer 90-190 BPM range typical for many genres
-        def score(t: float) -> float:
-            # Closer to mid-tempo gets a slight boost
-            target = 120.0
-            return -abs(t - target)
-
-        candidates = [tempo]
-        if tempo < 90:
-            candidates.append(tempo * 2)
-        if tempo > 180:
-            candidates.append(tempo / 2)
-
-        best = max(candidates, key=score)
-        return float(best)
-    except Exception:
-        # Fallback: beat_track directly
+def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int) -> tuple[float, list[tuple[float, float]]]:
+    """Detect BPM robustly using onset envelope, tempogram autocorrelation, and resolve half/double.
+    Returns (best_bpm, candidates[(bpm, confidence)...])
+    """
+    hop_length = 512
+    onset_env = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop_length, aggregate=np.median)
+    if onset_env.size == 0 or np.all(onset_env == 0):
+        # Fallback to beat_track on raw signal
         tempo, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
+        tempo = float(tempo)
         if tempo < 90:
             tempo *= 2
         if tempo > 180:
             tempo /= 2
-        return float(max(60.0, min(220.0, tempo)))
+        return tempo, [(tempo, 0.5)]
 
-def _detect_key(y_harm: np.ndarray, sr: int) -> str:
-    """Detect musical key using tuned, beat-synchronous harmonic chroma and KS profiles."""
+    # Autocorrelation for candidate lags
+    ac = librosa.autocorrelate(onset_env, max_size=onset_env.shape[0] // 2)
+    ac[:2] = 0  # suppress 0/1 lag
+
+    # Convert lags to BPM
+    lags = np.arange(1, len(ac))
+    bpms = 60.0 * sr / (hop_length * lags)
+
+    # Keep plausible BPM range
+    mask = (bpms >= 60) & (bpms <= 220)
+    bpms = bpms[mask]
+    strengths = ac[1:][mask]
+
+    # Peak pick
+    peaks, _ = signal.find_peaks(strengths, distance=2)
+    if len(peaks) == 0:
+        # fallback to librosa tempo candidates
+        tempos = librosa.beat.tempo(onset_envelope=onset_env, sr=sr, hop_length=hop_length, aggregate=None)
+        if tempos is None or len(tempos) == 0:
+            tempo, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
+            return float(tempo), [(float(tempo), 0.5)]
+        # Normalize confidences
+        confs = np.linspace(1.0, 0.5, num=min(5, len(tempos)))
+        chosen = list(zip(tempos[:5], confs))
+        best = float(tempos[0])
+        # half/double adjustment
+        if best < 90:
+            best *= 2
+        if best > 180:
+            best /= 2
+        return float(best), [(float(b), float(c)) for b, c in chosen]
+
+    cand_bpms = bpms[peaks]
+    cand_strengths = strengths[peaks]
+
+    # Normalize strengths to [0,1]
+    if cand_strengths.max() > 0:
+        cand_confs = (cand_strengths - cand_strengths.min()) / (cand_strengths.max() - cand_strengths.min() + 1e-9)
+    else:
+        cand_confs = np.zeros_like(cand_strengths)
+
+    # Generate half/double variants and pick best scoring per equivalence class
+    scored: list[tuple[float, float]] = []
+    for bpm, conf in zip(cand_bpms, cand_confs):
+        variants = {bpm}
+        if bpm < 90:
+            variants.add(bpm * 2)
+        if bpm > 180:
+            variants.add(bpm / 2)
+        for v in variants:
+            # score prefers mid-tempo and higher confidence
+            score = conf - (abs(v - 120.0) / 200.0)
+            scored.append((float(v), float(max(0.0, score))))
+
+    # Deduplicate by rounding BPM
+    agg: dict[int, float] = {}
+    for b, s in scored:
+        key = int(round(b))
+        agg[key] = max(agg.get(key, 0.0), s)
+    # Sort by score desc
+    sorted_cands = sorted(((float(k), v) for k, v in agg.items()), key=lambda x: x[1], reverse=True)
+    best_bpm = sorted_cands[0][0] if sorted_cands else float(librosa.beat.tempo(onset_envelope=onset_env, sr=sr))
+    return best_bpm, sorted_cands
+
+def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
+    """Detect musical key and provide candidates with confidence using tuned, beat-synchronous chroma.
+    Returns (best_key, [(key, confidence)...])
+    """
     try:
-        # Estimate tuning and compute constant-Q chroma on harmonic signal
+        # Estimate tuning and compute chroma CQT on harmonic signal
         tuning = librosa.estimate_tuning(y=y_harm, sr=sr)
         chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, tuning=tuning, bins_per_octave=12, n_chroma=12)
 
-        # Beat-synchronous average to reduce percussive/leak noise
+        # Beat-synchronous median aggregation
         tempo, beats = librosa.beat.beat_track(y=y_harm, sr=sr)
         if beats is not None and len(beats) > 1:
             chroma_sync = librosa.util.sync(chroma, beats, aggregate=np.median)
@@ -224,37 +264,35 @@ def _detect_key(y_harm: np.ndarray, sr: int) -> str:
             chroma_sync = chroma
 
         chroma_mean = np.mean(chroma_sync, axis=1)
-        chroma_sum = np.sum(chroma_mean)
-        if chroma_sum > 0:
-            chroma_mean = chroma_mean / chroma_sum
+        s = np.sum(chroma_mean)
+        if s > 0:
+            chroma_mean = chroma_mean / s
 
-        # Krumhansl-Schmuckler profiles
+        # KS profiles
         major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
         minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
         major_profile = major_profile / np.sum(major_profile)
         minor_profile = minor_profile / np.sum(minor_profile)
-
         keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-        best_key = "C Major"
-        best_corr = -1.0
-
+        candidates: list[tuple[str, float]] = []
         for i in range(12):
-            maj = np.roll(major_profile, i)
-            minr = np.roll(minor_profile, i)
-            cmaj = np.corrcoef(chroma_mean, maj)[0, 1]
-            cmin = np.corrcoef(chroma_mean, minr)[0, 1]
-            if cmaj > best_corr:
-                best_corr = cmaj
-                best_key = f"{keys[i]} Major"
-            if cmin > best_corr:
-                best_corr = cmin
-                best_key = f"{keys[i]} Minor"
+            cmaj = float(np.corrcoef(chroma_mean, np.roll(major_profile, i))[0, 1])
+            cmin = float(np.corrcoef(chroma_mean, np.roll(minor_profile, i))[0, 1])
+            candidates.append((f"{keys[i]} Major", cmaj))
+            candidates.append((f"{keys[i]} Minor", cmin))
 
-        return best_key
+        # Sort by correlation (confidence)
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_key, best_conf = candidates[0]
+
+        # Normalize confidences to 0..1 by top score
+        top = max(c for _, c in candidates) or 1.0
+        norm_cands = [(k, c / top) for k, c in candidates]
+        return best_key, norm_cands
     except Exception as e:
         print(f"Key detection error: {e}")
-        return "C Major"
+        return "C Major", [("C Major", 0.0)]
 
 def _simple_vocal_removal(wav_path: str, tmpdir: str, stem_type: str) -> str:
     """Simple vocal removal using center channel extraction."""
