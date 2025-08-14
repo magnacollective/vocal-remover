@@ -15,7 +15,9 @@ COPY requirements.txt .
 
 # Install Python dependencies
 # Ensure latest packaging tools for building wheels
+# Install Cython first so madmom's setup.py can import it during egg_info
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir Cython==0.29.36 && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
