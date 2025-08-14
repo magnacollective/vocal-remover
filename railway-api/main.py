@@ -50,6 +50,13 @@ async def cors_handler(request: Request, call_next):
 def root():
     return {"status": "ok", "service": "vocal-remover-api"}
 
+@app.get("/version")
+def version():
+    """Expose build metadata to verify deployments."""
+    sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_SHA") or "unknown"
+    ts = os.getenv("BUILD_TIME") or "unknown"
+    return {"commit": sha, "build_time": ts, "allowed_origins": ALLOWED_ORIGINS}
+
 @app.get("/health")
 def health():
     return {"status": "healthy"}
@@ -57,9 +64,12 @@ def health():
 @app.post("/analyze")
 async def analyze_audio(
     audio: UploadFile = File(...),
-    window_sec: int = Query(75, ge=15, le=180),
-    prefer_min_bpm: int = Query(90, ge=40, le=200),
-    prefer_max_bpm: int = Query(180, ge=60, le=240),
+    window_sec: int = Query(75, ge=15, le=180, description="Center window length to analyze in seconds"),
+    prefer_min_bpm: int = Query(90, ge=40, le=200, description="Lower bound of preferred BPM range"),
+    prefer_max_bpm: int = Query(180, ge=60, le=240, description="Upper bound of preferred BPM range"),
+    genre: str | None = Query(None, description="Optional genre hint (edm, hiphop, pop, house, techno, trap)"),
+    profile: str = Query("fast", regex="^(fast|accurate)$", description="Analysis profile"),
+    backend: str = Query("librosa", regex="^(librosa)$", description="Analysis backend"),
 ):
     """Analyze uploaded audio for BPM, key, duration, and sample rate.
     Returns: {"bpm": float, "key": string, "duration": string, "sample_rate": string}
@@ -73,8 +83,23 @@ async def analyze_audio(
             with open(input_path, "wb") as f:
                 shutil.copyfileobj(audio.file, f)
 
+            # Adjust defaults by genre/profile
+            if genre:
+                g = genre.lower()
+                if g in {"edm", "house", "techno", "trance"}:
+                    prefer_min_bpm, prefer_max_bpm = 110, 200
+                elif g in {"hiphop", "trap"}:
+                    prefer_min_bpm, prefer_max_bpm = 60, 180
+                elif g in {"pop", "rock"}:
+                    prefer_min_bpm, prefer_max_bpm = 70, 190
+
+            if profile == "accurate":
+                window = min(120, max(60, window_sec))
+            else:
+                window = min(75, max(45, window_sec))
+
             # Convert to speedy analysis WAV (mono, 22.05kHz, middle window)
-            wav_path = _prepare_analysis_wav(input_path, tmpdir, window_sec=window_sec)
+            wav_path = _prepare_analysis_wav(input_path, tmpdir, window_sec=window)
             print(f"[analyze] Processing: {wav_path}")
 
             # Load audio with librosa (mono for analysis)
