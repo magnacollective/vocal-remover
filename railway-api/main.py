@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 import tempfile
 import os
 import shutil
@@ -107,34 +108,41 @@ async def separate_stems(
     """
     print(f"[separate] Received file: {audio.filename}, stem_type: {stem_type}")
     
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # Use a persistent temp dir for the duration of the response and clean up after sending
+    tmpdir = tempfile.mkdtemp(prefix="vr-")
+    try:
+        # Save uploaded file
+        input_path = os.path.join(tmpdir, audio.filename or "audio")
+        with open(input_path, "wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        # Convert to WAV if needed
+        wav_path = _ensure_wav(input_path, tmpdir)
+        print(f"[separate] Processing: {wav_path}")
+
+        # For now, use simple vocal removal technique
+        # TODO: Integrate HTDemucs or other advanced models
+        output_path = _simple_vocal_removal(wav_path, tmpdir, stem_type)
+
+        if not os.path.exists(output_path):
+            raise HTTPException(status_code=500, detail="Stem separation failed: output not created")
+
+        # Return the separated audio file and clean up tmpdir after response is sent
+        return FileResponse(
+            output_path,
+            media_type="audio/wav",
+            filename=f"{stem_type}_separated.wav",
+            background=BackgroundTask(shutil.rmtree, tmpdir, True),
+        )
+
+    except Exception as e:
+        print(f"[separate] Error: {e}")
+        # Ensure cleanup on error as well
         try:
-            # Save uploaded file
-            input_path = os.path.join(tmpdir, audio.filename or "audio")
-            with open(input_path, "wb") as f:
-                shutil.copyfileobj(audio.file, f)
-            
-            # Convert to WAV if needed
-            wav_path = _ensure_wav(input_path, tmpdir)
-            print(f"[separate] Processing: {wav_path}")
-            
-            # For now, use simple vocal removal technique
-            # TODO: Integrate HTDemucs or other advanced models
-            output_path = _simple_vocal_removal(wav_path, tmpdir, stem_type)
-            
-            if not os.path.exists(output_path):
-                raise HTTPException(status_code=500, detail="Stem separation failed: output not created")
-            
-            # Return the separated audio file
-            return FileResponse(
-                output_path,
-                media_type="audio/wav",
-                filename=f"{stem_type}_separated.wav",
-            )
-            
-        except Exception as e:
-            print(f"[separate] Error: {e}")
-            raise HTTPException(status_code=500, detail=f"Stem separation failed: {str(e)}")
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Stem separation failed: {str(e)}")
 
 def _ensure_wav(input_path: str, tmpdir: str) -> str:
     """Convert input audio to WAV format using FFmpeg."""
