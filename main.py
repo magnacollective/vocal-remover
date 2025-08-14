@@ -226,10 +226,24 @@ def _simple_vocal_removal(wav_path: str, tmpdir: str, stem_type: str) -> str:
         
         # Save output
         output_path = os.path.join(tmpdir, f"{stem_type}.wav")
-        # Write as (frames, channels) - transpose to get correct shape
-        sf.write(output_path, output.T, sr)
+        print(f"[vocal_removal] Writing to: {output_path}")
+        print(f"[vocal_removal] Output shape: {output.shape}, dtype: {output.dtype}")
         
-        print(f"[vocal_removal] Created {stem_type} stem: {output_path}")
+        # Write as (frames, channels) - transpose to get correct shape
+        try:
+            sf.write(output_path, output.T, sr)
+            print(f"[vocal_removal] sf.write completed")
+        except Exception as write_error:
+            print(f"[vocal_removal] sf.write failed: {write_error}")
+            raise
+        
+        # Verify file was actually created
+        if not os.path.exists(output_path):
+            print(f"[vocal_removal] ERROR: File was not created at {output_path}")
+            raise HTTPException(status_code=500, detail=f"Failed to create output file: {output_path}")
+        
+        file_size = os.path.getsize(output_path)
+        print(f"[vocal_removal] Created {stem_type} stem: {output_path} (size: {file_size} bytes)")
         return output_path
         
     except Exception as e:
