@@ -74,7 +74,10 @@ def get_cached_model():
 # CORS configuration (env-driven with safe defaults)
 ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "*")
 # Clean up origins: remove semicolons and extra whitespace
-ALLOWED_ORIGINS = [origin.strip().rstrip(';') for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
+if ALLOWED_ORIGINS_STR == "*":
+    ALLOWED_ORIGINS = ["*"]
+else:
+    ALLOWED_ORIGINS = [origin.strip().rstrip(';').strip('"').strip("'") for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
 print(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
 
 # Use only FastAPI's CORSMiddleware to avoid duplicate headers
@@ -89,7 +92,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "vocal-remover-api"}
+    return {"status": "ok", "service": "vocal-remover-api", "port": os.getenv("PORT", "8000")}
 
 @app.get("/version")
 def version():
@@ -680,5 +683,6 @@ if __name__ == "__main__":
     import uvicorn
     # Railway needs PORT env variable
     port = int(os.getenv("PORT", 8000))
-    print(f"[startup] Starting server on port {port}")
+    print(f"[MAIN] Starting server on port {port}", flush=True)
+    print(f"[MAIN] Environment PORT: {os.getenv('PORT', 'NOT SET')}", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
