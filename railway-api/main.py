@@ -38,9 +38,23 @@ async def lifespan(app: FastAPI):
     """Load model at startup to avoid first-request delays."""
     global _CACHED_MODEL
     if _HAVE_DEMUCS:
+        # Optimize torch for multi-CPU performance
+        import torch
+        num_threads = min(32, os.cpu_count() or 4)  # Use up to 32 threads
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(num_threads)
+        print(f"[startup] Configured torch with {num_threads} threads")
+        
         print("[startup] Loading htdemucs model...")
         _CACHED_MODEL = pretrained.get_model('htdemucs')
         _CACHED_MODEL.eval()
+        
+        # Move model to GPU if available
+        if torch.cuda.is_available():
+            _CACHED_MODEL = _CACHED_MODEL.cuda()
+            print("[startup] Model loaded on GPU")
+        else:
+            print("[startup] Model loaded on CPU")
         print("[startup] Model loaded and ready")
     else:
         print("[startup] Demucs not available, using fallback methods")
@@ -504,7 +518,7 @@ def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[
         return "C Major", [("C Major", 0.0)]
 
 def _ai_vocal_separation(wav_path: str, tmpdir: str, stem_type: str) -> str:
-    """AI-based vocal separation using Demucs."""
+    """AI-based vocal separation using Demucs with chunking for large files."""
     try:
         print(f"[ai_separation] Starting AI separation for {stem_type}")
         
@@ -517,14 +531,23 @@ def _ai_vocal_separation(wav_path: str, tmpdir: str, stem_type: str) -> str:
         wav = load_track(wav_path, model.audio_channels, model.samplerate)
         print(f"[ai_separation] Loaded audio: {wav.shape}")
         
-        # Apply separation with GPU if available
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Determine device (model may already be on GPU from startup)
+        device = next(model.parameters()).device
         print(f"[ai_separation] Using device: {device}")
         
-        ref = wav.mean(0)  
-        wav = (wav - ref.mean()) / ref.std()  # Normalize
-        sources = apply_model(model, wav[None], device=device, progress=True)[0]
-        sources = sources * ref.std() + ref.mean()  # Denormalize
+        # Check if file is large and needs chunking (>3 minutes = 180 seconds)
+        duration_sec = wav.shape[-1] / model.samplerate
+        chunk_size_sec = 60  # Process in 60-second chunks
+        
+        if duration_sec > 180:
+            print(f"[ai_separation] Large file ({duration_sec:.1f}s), using chunking")
+            sources = _process_in_chunks(model, wav, device, chunk_size_sec)
+        else:
+            print(f"[ai_separation] Small file ({duration_sec:.1f}s), processing whole")
+            ref = wav.mean(0)  
+            wav = (wav - ref.mean()) / ref.std()  # Normalize
+            sources = apply_model(model, wav[None], device=device, progress=True)[0]
+            sources = sources * ref.std() + ref.mean()  # Denormalize
         
         # Get source names (typically: drums, bass, other, vocals)
         source_names = model.sources
@@ -573,6 +596,42 @@ def _ai_vocal_separation(wav_path: str, tmpdir: str, stem_type: str) -> str:
         print(f"[ai_separation] Falling back to simple vocal removal")
         # Fallback to simple method if AI separation fails
         return _simple_vocal_removal(wav_path, tmpdir, stem_type)
+
+def _process_in_chunks(model, wav, device, chunk_size_sec=60):
+    """Process large audio files in chunks to reduce memory usage and improve progress feedback."""
+    import torch
+    
+    sr = model.samplerate
+    chunk_samples = int(chunk_size_sec * sr)
+    total_samples = wav.shape[-1]
+    n_chunks = (total_samples + chunk_samples - 1) // chunk_samples
+    
+    print(f"[chunking] Processing {n_chunks} chunks of {chunk_size_sec}s each")
+    
+    # Initialize output tensors
+    all_sources = []
+    
+    for i in range(n_chunks):
+        start_idx = i * chunk_samples
+        end_idx = min((i + 1) * chunk_samples, total_samples)
+        chunk = wav[..., start_idx:end_idx]
+        
+        print(f"[chunking] Processing chunk {i+1}/{n_chunks}")
+        
+        # Normalize chunk
+        ref = chunk.mean(0)
+        chunk_norm = (chunk - ref.mean()) / (ref.std() + 1e-8)
+        
+        # Process chunk
+        with torch.no_grad():  # Save memory
+            chunk_sources = apply_model(model, chunk_norm[None], device=device, progress=False)[0]
+            chunk_sources = chunk_sources * ref.std() + ref.mean()
+        
+        all_sources.append(chunk_sources.cpu())  # Move to CPU to save GPU memory
+        
+    # Concatenate all chunks
+    sources = torch.cat(all_sources, dim=-1)
+    return sources
 
 def _simple_vocal_removal(wav_path: str, tmpdir: str, stem_type: str) -> str:
     """Simple vocal removal using center channel extraction."""
