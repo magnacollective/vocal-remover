@@ -112,17 +112,20 @@ async def analyze_audio(
             y, sr = librosa.load(wav_path, sr=22050, mono=True)
             duration_seconds = len(y) / sr
 
-            # Separate harmonic/percussive for improved analysis
-            y_harm, y_perc = librosa.effects.hpss(y)
-
-            # Detect BPM
-            if backend == "pro" and _HAVE_MADMOM:
-                bpm, bpm_candidates = _madmom_bpm(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+            if profile == "fast":
+                # Ultra-fast path: avoid HPSS/CQT/beat tracking
+                bpm, bpm_candidates = _detect_bpm_fast(y, sr, prefer_min_bpm, prefer_max_bpm)
+                key, key_candidates = _detect_key_fast(y, sr)
             else:
-                bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
-
-            # Detect key from harmonic content with tuning + beat sync
-            key, key_candidates = _detect_key_with_candidates(y_harm, sr)
+                # Accurate path: HPSS and robust key detection
+                y_harm, y_perc = librosa.effects.hpss(y)
+                # Detect BPM
+                if backend == "pro" and _HAVE_MADMOM:
+                    bpm, bpm_candidates = _madmom_bpm(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+                else:
+                    bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+                # Detect key from harmonic content with tuning + beat sync
+                key, key_candidates = _detect_key_with_candidates(y_harm, sr)
 
             analysis_result = {
                 "bpm": round(float(bpm), 1),
@@ -218,8 +221,12 @@ def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 75) ->
     ]
     subprocess.check_call(cmd)
 
-    # Load to get duration and trim middle segment
-    y, sr = librosa.load(probe, sr=22050, mono=True)
+    # Load to get duration and trim middle segment (use soundfile for speed)
+    data, sr = sf.read(probe, dtype='float32', always_2d=False)
+    if data.ndim > 1:
+        y = data.mean(axis=1)
+    else:
+        y = data
     total_sec = len(y) / sr
     win = max(15, min(window_sec, int(total_sec)))
     start = max(0, int((total_sec - win) / 2))
@@ -356,6 +363,59 @@ def _madmom_bpm(y_perc: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -
             _sh.rmtree(tmpdir, ignore_errors=True)
         except Exception:
             pass
+
+def _detect_bpm_fast(y: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -> tuple[float, list[tuple[float, float]]]:
+    """Very fast BPM estimate: novelty from high-pass + energy envelope + autocorr peak."""
+    # High-pass to emphasize percussive onsets
+    sos = signal.butter(2, 100/(sr/2), btype='highpass', output='sos')
+    z = signal.sosfilt(sos, y)
+    env = np.abs(z)
+    env = signal.lfilter([1, -1], [1, -0.99], env)  # simple differentiator + decay
+    env = env - np.mean(env)
+    env = np.maximum(env, 0)
+    # Downsample envelope for speed
+    hop = 256
+    env_ds = env[::hop]
+    ac = librosa.autocorrelate(env_ds, max_size=len(env_ds)//2)
+    ac[:2] = 0
+    lags = np.arange(1, len(ac))
+    bpms = 60.0 * sr / (hop * lags)
+    mask = (bpms >= 60) & (bpms <= 220)
+    bpms = bpms[mask]
+    strengths = ac[1:][mask]
+    if len(strengths) == 0:
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        return float(tempo), [(float(tempo), 0.5)]
+    peak = int(np.argmax(strengths))
+    est = float(bpms[peak])
+    if est < prefer_min:
+        est *= 2
+    if est > prefer_max:
+        est /= 2
+    return est, [(est, 1.0)]
+
+def _detect_key_fast(y: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
+    """Very fast key estimate: coarse chroma CENS over downsampled audio."""
+    chroma = librosa.feature.chroma_cens(y=y, sr=sr)
+    vec = chroma.mean(axis=1)
+    s = float(vec.sum())
+    if s > 0:
+        vec = vec / s
+    major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+    minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+    major_profile /= major_profile.sum()
+    minor_profile /= minor_profile.sum()
+    keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    cands = []
+    for i in range(12):
+        cmaj = float(np.corrcoef(vec, np.roll(major_profile, i))[0, 1])
+        cmin = float(np.corrcoef(vec, np.roll(minor_profile, i))[0, 1])
+        cands.append((f"{keys[i]} Major", cmaj))
+        cands.append((f"{keys[i]} Minor", cmin))
+    cands.sort(key=lambda x: x[1], reverse=True)
+    top = cands[0][1] if cands else 1.0
+    norm = [(k, (c/top) if top else 0.0) for k, c in cands]
+    return (norm[0][0] if norm else "C Major"), norm[:5]
 
 def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
     """Detect musical key with two robust chroma variants and pick the stronger one.
