@@ -9,6 +9,12 @@ import subprocess
 import librosa
 import numpy as np
 from scipy import signal
+try:
+    import madmom
+    from madmom.features.beats import DBNBeatTrackingProcessor, RNNBeatProcessor
+    _HAVE_MADMOM = True
+except Exception:
+    _HAVE_MADMOM = False
 import soundfile as sf
 
 app = FastAPI(title="Vocal Remover & Audio Analysis API")
@@ -69,7 +75,7 @@ async def analyze_audio(
     prefer_max_bpm: int = Query(180, ge=60, le=240, description="Upper bound of preferred BPM range"),
     genre: str | None = Query(None, description="Optional genre hint (edm, hiphop, pop, house, techno, trap)"),
     profile: str = Query("fast", regex="^(fast|accurate)$", description="Analysis profile"),
-    backend: str = Query("librosa", regex="^(librosa)$", description="Analysis backend"),
+    backend: str = Query("librosa", regex="^(librosa|pro)$", description="Analysis backend"),
 ):
     """Analyze uploaded audio for BPM, key, duration, and sample rate.
     Returns: {"bpm": float, "key": string, "duration": string, "sample_rate": string}
@@ -109,8 +115,11 @@ async def analyze_audio(
             # Separate harmonic/percussive for improved analysis
             y_harm, y_perc = librosa.effects.hpss(y)
 
-            # Detect BPM from percussive/onset envelope; resolve half/double and expose candidates
-            bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+            # Detect BPM
+            if backend == "pro" and _HAVE_MADMOM:
+                bpm, bpm_candidates = _madmom_bpm(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
+            else:
+                bpm, bpm_candidates = _detect_bpm_with_candidates(y_perc, sr, prefer_min_bpm, prefer_max_bpm)
 
             # Detect key from harmonic content with tuning + beat sync
             key, key_candidates = _detect_key_with_candidates(y_harm, sr)
@@ -302,6 +311,51 @@ def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int, prefer_min: int = 9
     sorted_cands = sorted(((float(k), v) for k, v in agg.items()), key=lambda x: x[1], reverse=True)
     best_bpm = sorted_cands[0][0] if sorted_cands else float(librosa.beat.tempo(onset_envelope=onset_env, sr=sr))
     return best_bpm, sorted_cands
+
+def _madmom_bpm(y_perc: np.ndarray, sr: int, prefer_min: int, prefer_max: int) -> tuple[float, list[tuple[float, float]]]:
+    """Tempo via madmom RNN + DBN beat tracker; return BPM and pseudo-confidence list."""
+    # madmom expects a file or mono float array; write a short temp wav to process reliably
+    import tempfile as _tmp
+    import os as _os
+    import uuid as _uuid
+    from soundfile import write as _sfwrite
+    tmpdir = _tmp.mkdtemp(prefix="mm-")
+    path = _os.path.join(tmpdir, f"{_uuid.uuid4().hex}.wav")
+    try:
+        _sfwrite(path, y_perc.astype(np.float32), sr)
+        proc = madmom.audio.signal.Signal(path)
+        act = RNNBeatProcessor()(path)
+        beats = DBNBeatTrackingProcessor(fps=100)(act)
+        # Estimate tempo from beat intervals
+        if len(beats) >= 2:
+            intervals = np.diff(beats)
+            tempos = 60.0 / intervals
+            # Robust central tendency
+            est = float(np.median(tempos))
+        else:
+            # fallback to librosa
+            est, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
+        # half/double adjustment
+        if est < prefer_min:
+            est *= 2
+        if est > prefer_max:
+            est /= 2
+        # Build a simple candidate list around estimate
+        candidates = [(est, 1.0)]
+        candidates += [(est * 2, 0.5), (est / 2, 0.5)]
+        # Dedup and sort
+        ded = {}
+        for b, c in candidates:
+            k = int(round(b))
+            ded[k] = max(ded.get(k, 0.0), c)
+        cand_list = sorted(((float(k), v) for k, v in ded.items()), key=lambda x: x[1], reverse=True)
+        return est, cand_list
+    finally:
+        try:
+            import shutil as _sh
+            _sh.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 def _detect_key_with_candidates(y_harm: np.ndarray, sr: int) -> tuple[str, list[tuple[str, float]]]:
     """Detect musical key and provide candidates with confidence using tuned, beat-synchronous chroma.
