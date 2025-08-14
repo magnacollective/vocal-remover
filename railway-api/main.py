@@ -31,6 +31,19 @@ import soundfile as sf
 
 app = FastAPI(title="Vocal Remover & Audio Analysis API")
 
+# Global model cache for performance
+_CACHED_MODEL = None
+
+def get_cached_model():
+    """Get cached htdemucs model, loading once at startup."""
+    global _CACHED_MODEL
+    if _CACHED_MODEL is None and _HAVE_DEMUCS:
+        print("[model_cache] Loading htdemucs model...")
+        _CACHED_MODEL = pretrained.get_model('htdemucs')
+        _CACHED_MODEL.eval()
+        print("[model_cache] Model loaded and cached")
+    return _CACHED_MODEL
+
 # CORS configuration (env-driven with safe defaults)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 print(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
@@ -471,18 +484,22 @@ def _ai_vocal_separation(wav_path: str, tmpdir: str, stem_type: str) -> str:
     try:
         print(f"[ai_separation] Starting AI separation for {stem_type}")
         
-        # Load htdemucs model
-        model = pretrained.get_model('htdemucs')
-        model.eval()
+        # Use cached htdemucs model
+        model = get_cached_model()
+        if model is None:
+            raise HTTPException(status_code=500, detail="Demucs model not available")
         
         # Load and convert audio
         wav = load_track(wav_path, model.audio_channels, model.samplerate)
         print(f"[ai_separation] Loaded audio: {wav.shape}")
         
-        # Apply separation
+        # Apply separation with GPU if available
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"[ai_separation] Using device: {device}")
+        
         ref = wav.mean(0)  
         wav = (wav - ref.mean()) / ref.std()  # Normalize
-        sources = apply_model(model, wav[None], device='cpu', progress=True)[0]
+        sources = apply_model(model, wav[None], device=device, progress=True)[0]
         sources = sources * ref.std() + ref.mean()  # Denormalize
         
         # Get source names (typically: drums, bass, other, vocals)
