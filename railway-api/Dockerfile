@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 COPY main.py .
 
 # Railway will set PORT env variable
-EXPOSE ${PORT:-8000}
+EXPOSE 8000
 
-# Run the application with PORT from environment
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Run the application with PORT from environment (shell form for variable expansion)
+CMD sh -c "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
