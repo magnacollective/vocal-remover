@@ -220,6 +220,8 @@ def _ensure_wav(input_path: str, tmpdir: str) -> str:
     try:
         subprocess.check_call(cmd)
         return output_path
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
 def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 75) -> str:
     """Convert input to fast-to-analyze mono 22.05kHz WAV and trim to the most informative middle window.
@@ -233,7 +235,10 @@ def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 75) ->
         "-vn", "-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le",
         probe,
     ]
-    subprocess.check_call(cmd)
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
     # Load to get duration and trim middle segment (use soundfile for speed)
     data, sr = sf.read(probe, dtype='float32', always_2d=False)
@@ -249,8 +254,6 @@ def _prepare_analysis_wav(input_path: str, tmpdir: str, window_sec: int = 75) ->
     out = os.path.join(tmpdir, "analysis.wav")
     sf.write(out, trimmed, sr)
     return out
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
 def _detect_bpm_with_candidates(y_perc: np.ndarray, sr: int, prefer_min: int = 90, prefer_max: int = 180) -> tuple[float, list[tuple[float, float]]]:
     """Detect BPM robustly using onset envelope, tempogram autocorrelation, and resolve half/double.
