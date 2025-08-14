@@ -60,39 +60,41 @@ async def analyze_audio(audio: UploadFile = File(...)):
     Returns: {"bpm": float, "key": string, "duration": string, "sample_rate": string}
     """
     print(f"[analyze] Received file: {audio.filename}")
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             # Save uploaded file
             input_path = os.path.join(tmpdir, audio.filename or "audio")
             with open(input_path, "wb") as f:
                 shutil.copyfileobj(audio.file, f)
-            
+
             # Convert to WAV if needed
             wav_path = _ensure_wav(input_path, tmpdir)
             print(f"[analyze] Processing: {wav_path}")
-            
+
             # Load audio with librosa
-            y, sr = librosa.load(wav_path, sr=None)
+            y, sr = librosa.load(wav_path, sr=None, mono=True)
             duration_seconds = len(y) / sr
-            
-            # Detect BPM
-            bpm = _detect_bpm(y, sr)
-            
-            # Detect key
-            key = _detect_key(y, sr)
-            
-            # Format results
+
+            # Separate harmonic/percussive for improved analysis
+            y_harm, y_perc = librosa.effects.hpss(y)
+
+            # Detect BPM from percussive/onset envelope; resolve half/double
+            bpm = _detect_bpm(y_perc, sr)
+
+            # Detect key from harmonic content with tuning + beat sync
+            key = _detect_key(y_harm, sr)
+
             analysis_result = {
                 "bpm": round(float(bpm), 1),
                 "key": key,
                 "duration": _format_duration(duration_seconds),
-                "sample_rate": f"{sr} Hz"
+                "sample_rate": f"{sr} Hz",
             }
-            
+
             print(f"[analyze] Analysis complete: {analysis_result}")
             return analysis_result
-            
+
         except Exception as e:
             print(f"[analyze] Error: {e}")
             raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
@@ -163,70 +165,93 @@ def _ensure_wav(input_path: str, tmpdir: str) -> str:
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {e}")
 
-def _detect_bpm(y: np.ndarray, sr: int) -> float:
-    """Detect BPM using librosa's tempo detection."""
+def _detect_bpm(y_perc: np.ndarray, sr: int) -> float:
+    """Detect BPM with onset envelope and resolve half/double tempo."""
     try:
-        # Use librosa's tempo detection
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        return float(tempo)
-    except:
-        # Fallback: simple onset-based detection
-        onset_frames = librosa.onset.onset_detect(y=y, sr=sr)
-        if len(onset_frames) < 2:
-            return 120.0  # Default BPM
-        
-        # Calculate average time between onsets
-        onset_times = librosa.frames_to_time(onset_frames, sr=sr)
-        intervals = np.diff(onset_times)
-        if len(intervals) == 0:
-            return 120.0
-            
-        avg_interval = np.median(intervals)
-        bpm = 60.0 / avg_interval if avg_interval > 0 else 120.0
-        
-        # Clamp to reasonable range
-        return max(60.0, min(200.0, bpm))
+        # Onset envelope from percussive signal
+        onset_env = librosa.onset.onset_strength(y=y_perc, sr=sr)
 
-def _detect_key(y: np.ndarray, sr: int) -> str:
-    """Detect musical key using chroma features."""
+        # Multiple tempo candidates
+        tempos = librosa.beat.tempo(
+            onset_envelope=onset_env,
+            sr=sr,
+            hop_length=512,
+            max_tempo=220,
+            aggregate=None,
+        )
+        if tempos is None or len(tempos) == 0:
+            raise ValueError("no tempo candidates")
+
+        # Use strongest candidate
+        tempo = float(tempos[0])
+
+        # Resolve half/double ambiguity with simple heuristics
+        # Prefer 90-190 BPM range typical for many genres
+        def score(t: float) -> float:
+            # Closer to mid-tempo gets a slight boost
+            target = 120.0
+            return -abs(t - target)
+
+        candidates = [tempo]
+        if tempo < 90:
+            candidates.append(tempo * 2)
+        if tempo > 180:
+            candidates.append(tempo / 2)
+
+        best = max(candidates, key=score)
+        return float(best)
+    except Exception:
+        # Fallback: beat_track directly
+        tempo, _ = librosa.beat.beat_track(y=y_perc, sr=sr)
+        if tempo < 90:
+            tempo *= 2
+        if tempo > 180:
+            tempo /= 2
+        return float(max(60.0, min(220.0, tempo)))
+
+def _detect_key(y_harm: np.ndarray, sr: int) -> str:
+    """Detect musical key using tuned, beat-synchronous harmonic chroma and KS profiles."""
     try:
-        # Extract chroma features
-        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-        chroma_mean = np.mean(chroma, axis=1)
-        
-        # Normalize
-        chroma_mean = chroma_mean / np.sum(chroma_mean)
-        
-        # Key profiles (Krumhansl-Schmuckler)
+        # Estimate tuning and compute constant-Q chroma on harmonic signal
+        tuning = librosa.estimate_tuning(y=y_harm, sr=sr)
+        chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr, tuning=tuning, bins_per_octave=12, n_chroma=12)
+
+        # Beat-synchronous average to reduce percussive/leak noise
+        tempo, beats = librosa.beat.beat_track(y=y_harm, sr=sr)
+        if beats is not None and len(beats) > 1:
+            chroma_sync = librosa.util.sync(chroma, beats, aggregate=np.median)
+        else:
+            chroma_sync = chroma
+
+        chroma_mean = np.mean(chroma_sync, axis=1)
+        chroma_sum = np.sum(chroma_mean)
+        if chroma_sum > 0:
+            chroma_mean = chroma_mean / chroma_sum
+
+        # Krumhansl-Schmuckler profiles
         major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
         minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-        
-        # Normalize profiles
         major_profile = major_profile / np.sum(major_profile)
         minor_profile = minor_profile / np.sum(minor_profile)
-        
+
         keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        
-        best_correlation = -1
+
         best_key = "C Major"
-        
+        best_corr = -1.0
+
         for i in range(12):
-            # Test major
-            major_shifted = np.roll(major_profile, i)
-            correlation = np.corrcoef(chroma_mean, major_shifted)[0, 1]
-            if correlation > best_correlation:
-                best_correlation = correlation
+            maj = np.roll(major_profile, i)
+            minr = np.roll(minor_profile, i)
+            cmaj = np.corrcoef(chroma_mean, maj)[0, 1]
+            cmin = np.corrcoef(chroma_mean, minr)[0, 1]
+            if cmaj > best_corr:
+                best_corr = cmaj
                 best_key = f"{keys[i]} Major"
-            
-            # Test minor
-            minor_shifted = np.roll(minor_profile, i)
-            correlation = np.corrcoef(chroma_mean, minor_shifted)[0, 1]
-            if correlation > best_correlation:
-                best_correlation = correlation
+            if cmin > best_corr:
+                best_corr = cmin
                 best_key = f"{keys[i]} Minor"
-        
+
         return best_key
-        
     except Exception as e:
         print(f"Key detection error: {e}")
         return "C Major"
