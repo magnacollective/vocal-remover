@@ -511,18 +511,19 @@ def _simple_vocal_removal(wav_path: str, tmpdir: str, stem_type: str) -> str:
         if stem_type == "vocals":
             # Extract center channel (vocals are usually centered)
             vocals = (y[0] + y[1]) / 2
-            output = np.array([vocals, vocals])
+            output = np.stack([vocals, vocals])
         elif stem_type == "instrumental":
             # Remove center channel (subtract vocals)
             instrumental = (y[0] - y[1]) / 2
-            output = np.array([instrumental, instrumental])
+            output = np.stack([instrumental, instrumental])
         else:
             # For drums, bass, all - just return instrumental for now
             instrumental = (y[0] - y[1]) / 2
-            output = np.array([instrumental, instrumental])
+            output = np.stack([instrumental, instrumental])
         
         # Save output
         output_path = os.path.join(tmpdir, f"{stem_type}.wav")
+        # Write as (frames, channels) - transpose to get correct shape
         sf.write(output_path, output.T, sr)
         
         print(f"[vocal_removal] Created {stem_type} stem: {output_path}")
