@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 import tempfile
@@ -173,12 +173,26 @@ async def separate_stems(
         if not os.path.exists(output_path):
             raise HTTPException(status_code=500, detail="Stem separation failed: output not created")
 
-        # Return the separated audio file and clean up tmpdir after response is sent
-        return FileResponse(
-            output_path,
+        # Stream the file to avoid occasional FileResponse stat race on ephemeral filesystems
+        file_handle = open(output_path, "rb")
+
+        def _cleanup():
+            try:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+        return StreamingResponse(
+            file_handle,
             media_type="audio/wav",
-            filename=f"{stem_type}_separated.wav",
-            background=BackgroundTask(shutil.rmtree, tmpdir, True),
+            headers={
+                "Content-Disposition": f"attachment; filename={stem_type}_separated.wav"
+            },
+            background=BackgroundTask(_cleanup),
         )
 
     except Exception as e:
