@@ -70,7 +70,8 @@ def get_cached_model():
 
 # CORS configuration (env-driven with safe defaults)
 ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "*")
-ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(",")]
+# Clean up origins: remove semicolons and extra whitespace
+ALLOWED_ORIGINS = [origin.strip().rstrip(';') for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
 print(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
 
 # Use only FastAPI's CORSMiddleware to avoid duplicate headers
@@ -674,4 +675,6 @@ def _format_duration(seconds: float) -> str:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Railway needs PORT env variable
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
