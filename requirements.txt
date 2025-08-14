@@ -5,5 +5,8 @@ librosa==0.10.1
 soundfile==0.12.1
 scipy==1.11.3
 numpy==1.24.3
+# Build helpers for native packages
+Cython==0.29.36
+madmom==0.16.1
 demucs==4.0.1
 torch>=2.0.0
