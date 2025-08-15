@@ -69,7 +69,7 @@ def get_cached_model():
     return _CACHED_MODEL
 
 # CORS configuration (env-driven with safe defaults)
-ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "https://www.studiobuddy.xyz,https://studiobuddy.xyz,https://studio-buddy-web.vercel.app,http://localhost:3000")
 # Clean up origins: handle both comma and semicolon separators, remove quotes
 if ALLOWED_ORIGINS_STR == "*":
     ALLOWED_ORIGINS = ["*"]
